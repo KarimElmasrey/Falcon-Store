@@ -5,26 +5,30 @@
 الأقسام: رجالي • حريمي • كوتشات • إكسسوارات
 ====================================================================
 طريقة التشغيل:
-1. تثبيت مكتبة فلاسك:
+1. تثبيت المكتبات المطلوبة:
    pip install flask flask-cors
 
-2. تشغيل سيرفر البوت:
+2. ضبط مفتاح Gemini API في متغيرات البيئة أو وضعه مباشرة:
+   set GEMINI_API_KEY=your_api_key_here
+
+3. تشغيل سيرفر البوت:
    python falcon_chatbot.py
 
-3. طريقة ربطه بالموقع (React أو HTML أو Node.js):
-   - الطريقة الأولى (سطر واحد في index.html يظهر البوت العائم مربوطاً بالبايثون تلقائياً):
-     <script src="http://127.0.0.1:5001/widget.js"></script>
-
-   - الطريقة الثانية (عن طريق API من React أو Node.js):
-     POST http://127.0.0.1:5001/api/chat
-     Body: { "message": "رسالة العميل", "session_id": "user_1" }
+4. ربطه بالموقع عبر سطر واحد في HTML:
+   <script src="http://127.0.0.1:5001/widget.js" defer></script>
 ====================================================================
 """
-
+import os
 import re
 import sys
+import json
+import uuid
+import urllib.request
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -273,14 +277,6 @@ class FalconStoreBot:
                 "last_category": None,
                 "last_intent": None,
                 "offer_variant": 0,
-                "order_flow": {
-                    "active": False,
-                    "item": None,
-                    "size": None,
-                    "name": None,
-                    "phone": None,
-                    "address": None,
-                },
             }
         return self.sessions[session_id]
 
@@ -364,21 +360,30 @@ class FalconStoreBot:
         session = self.get_session(session_id)
         clean_input = str(message).strip()
         n = self.normalize_arabic(clean_input)
+        words = set(re.findall(r"\w+", n))
 
         mentioned_cat = self.detect_category(n)
-        is_asking_offers = self.has_any(
-            n,
-            ["عرض", "عروض", "الاعروض", "عروص", "خصم", "خصومات", "تخفيض", "تخفيضات", "كوبون", "برومو", "اوفر", "باكدج"],
-        )
-        is_asking_sizes = self.has_any(n, ["مقاس", "سايز", "وزن", "طول", "يلبس"])
-        is_asking_fabrics = self.has_any(
-            n, ["خامه", "خامات", "قماش", "قطن", "بيوبر", "تغسل", "انكماش", "بيكش", "جوده", "اصلي", "ضمان", "الوان", "لون"]
-        )
-        is_asking_recommend = self.has_any(n, ["رشح", "تنصح", "احسن", "افضل", "اكتر حاجه", "ارخص", "هديه", "هدايا"])
 
-        # 1. العروض الذكية المرتبطة بالسياق
+        is_asking_offers = (
+            self.has_any(
+                n,
+                ["عرض", "عروض", "الاعروض", "عروص", "خصم", "خصومات", "تخفيض", "تخفيضات", "كوبون", "برومو", "باكدج"],
+            )
+            or "اوفر" in words
+        )
+        is_asking_sizes = self.has_any(n, ["مقاس", "سايز", "يلبس", "طولي", "طولك", "وزني", "وزنك"])
+        is_asking_fabrics = self.has_any(
+            n,
+            ["خامه", "خامات", "قماش", "قطن", "بيوبر", "تغسل", "انكماش", "بيكش", "جوده", "اصلي", "ضمان", "الوان", "لون"],
+        )
+        is_asking_recommend = self.has_any(
+            n,
+            ["رشح", "ترشيح", "تنصح", "الاكثر مبيعا", "اكتر مبيعا", "افضل", "احسن", "مبيع"],
+        )
+
+        # 1. العروض
         if is_asking_offers:
-            if "كل عروض المتجر" in n or "عروض عامه" in n:
+            if self.has_any(n, ["كل عروض المتجر", "عروض عامه"]):
                 return self.format_general_offers(session)
             if mentioned_cat:
                 session["last_category"] = mentioned_cat
@@ -406,51 +411,26 @@ class FalconStoreBot:
                 "last_category": prod_cat_key,
             }
 
-        # 3. حساب المقاسات الذكي بالأرقام أو تتبع الطلب
+        # 3. الأرقام: مقاسات الكوتشي أو مقاسات الملابس حسب الوزن
         nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", self.normalize_digits(clean_input))]
         if nums:
-            if self.has_any(n, ["طلب", "اوردر", "تتبع"]) or "#" in clean_input:
-                return {
-                    "reply": (
-                        f"📦 حالة الطلب رقم #{int(nums[0])}:\n"
-                        "طلبك قيد التجهيز والتغليف حالياً في مخازن Falcon Store، "
-                        "وسيخرج مع شركة الشحن للتوصيل خلال 24 ساعة."
-                    ),
-                    "choices": ["رجالي", "حريمي", "كوتشات", "إكسسوارات"],
-                    "last_category": session["last_category"],
-                }
-
             shoe_cm = next((v for v in nums if 22 <= v <= 31), None)
-            if shoe_cm and (
-                self.has_any(n, ["سم", "سنتي", "رجل", "قدم", "كوتش", "مقاس"])
-                or session["last_category"] == "sneakers"
-            ):
-                if shoe_cm <= 23.5:
-                    eu = "37"
-                elif shoe_cm <= 24.2:
-                    eu = "38"
-                elif shoe_cm <= 25.0:
-                    eu = "39"
-                elif shoe_cm <= 25.8:
-                    eu = "40"
-                elif shoe_cm <= 26.5:
-                    eu = "41"
-                elif shoe_cm <= 27.3:
-                    eu = "42"
-                elif shoe_cm <= 28.0:
-                    eu = "43"
-                elif shoe_cm <= 28.8:
-                    eu = "44"
-                else:
-                    eu = "45"
+            has_cm_word = bool(re.search(r"سم|سنت|رجل|قدم", n))
+            if shoe_cm and (has_cm_word or session["last_category"] == "sneakers"):
+                sizes_eu = [
+                    (23.5, "37"), (24.2, "38"), (25.0, "39"), (25.8, "40"),
+                    (26.5, "41"), (27.3, "42"), (28.0, "43"), (28.8, "44"),
+                ]
+                eu = next((size for limit, size in sizes_eu if shoe_cm <= limit), "45")
                 return {
-                    "reply": f"👟 لطول قدم {shoe_cm} سم، المقاس الأنسب في الكوتشات هو {eu} EU.",
+                    "reply": f"👟 لطول قدم {shoe_cm:g} سم، المقاس الأنسب في الكوتشات هو {eu} EU.",
                     "choices": ["كوتشات", "عروض الكوتشات"],
                     "last_category": "sneakers",
                 }
 
+            has_weight_word = bool(re.search(r"كيلو|كجم|وزن", n))
             weight = next((v for v in nums if 40 <= v <= 145), None)
-            if weight:
+            if weight and has_weight_word:
                 if weight < 60:
                     size, pant = "S", "28-30"
                 elif weight <= 73:
@@ -471,7 +451,7 @@ class FalconStoreBot:
                     "last_category": session["last_category"],
                 }
 
-        # 4. سؤال عن المقاسات حسب القسم المفتوح
+        # 4. سؤال عن المقاسات
         if is_asking_sizes:
             target_cat = mentioned_cat or session["last_category"]
             if target_cat and target_cat in self.catalog:
@@ -485,7 +465,7 @@ class FalconStoreBot:
                 "reply": (
                     "📏 دليل مقاسات Falcon Store:\n"
                     "• الملابس (رجالي وحريمي): متاحة من S حتى XXL (وبناطيل من 28 لـ 38). "
-                    "اكتبلي وزنك وطولك وهقولك مقاسك فوراً.\n"
+                    "اكتبلي وزنك بالكيلو وطولك بالسنتيمتر وهقولك مقاسك فوراً.\n"
                     "• الكوتشات: متاحة من مقاس 37 لـ 45 قالب مظبوط."
                 ),
                 "choices": ["رجالي", "حريمي", "كوتشات"],
@@ -549,7 +529,7 @@ class FalconStoreBot:
                 "reply": (
                     "📋 ملخص أسعار Falcon Store:\n"
                     "• الرجالي: تيشيرتات (450 ج)، قمصان (580 ج)، بناطيل كارجو (650 ج)، هوديز (750 ج).\n"
-                    "• الحريمي: شميزات كتان (520 ج)، جينز وايد ليج (680 ج)، دريسات (720 ج)، أطقم كارديجان (850 ج).\n"
+                    "• الحريمي: شميزات كتان (520 ج), جينز وايد ليج (680 ج)، دريسات (720 ج)، أطقم كارديجان (850 ج).\n"
                     "• الكوتشات: تبدأ من 790 ج حتى 920 ج (مقاسات 37 لـ 45).\n"
                     "• الإكسسوارات: نظارات (380 ج)، طقم محفظة وحزام جلد (520 ج)، شنط (590 ج)، ساعات (620 ج)."
                 ),
@@ -611,81 +591,97 @@ class FalconStoreBot:
                 "last_category": session["last_category"],
             }
 
-        return {
-            "reply": (
-                f"أهلاً بيك في Falcon Store ✨\n"
-                "أقدر أساعدك فوراً في:\n"
-                "• عرض أقسام: الرجالي، الحريمي، الكوتشات، والإكسسوارات\n"
-                "• معرفة العروض والخصومات لكل قسم\n"
-                "• حساب مقاسك بالوزن والطول أو معرفة تفاصيل الشحن"
-            ),
-            "choices": ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"],
-            "last_category": session["last_category"],
-        }
+        # 13. أي سؤال خارج البيانات المحلية يروح لـ Gemini
+        return ask_gemini_fallback(clean_input, session_id, self)
 
 
-# إنشاء نسخة من البوت
+# إنشاء نسخة رئيسية من البوت
 bot = FalconStoreBot()
 
 
-# ================== نقاط الاتصال (Flask Routes) للربط مع الموقع ==================
+from google import genai
+from google.genai import types
+
+def ask_gemini_fallback(user_message: str, session_id: str, bot_instance: FalconStoreBot) -> dict:
+    """دالة الاتصال بـ Gemini باستخدام مكتبة google-genai الرسمية"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(env_path)
+    
+    api_key = os.getenv("GEMINI_API_KEY")
+    choices = ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"]
+    last_category = bot_instance.get_session(session_id).get("last_category")
+
+    if not api_key:
+        print("❌ تنبيه: مفتاح GEMINI_API_KEY غير موجود في ملف .env")
+        return {
+            "reply": "أهلاً بك في Falcon Store! أقدر أساعدك في معرفة تفاصيل المنتجات، الأسعار، العروض، والشحن.",
+            "choices": choices,
+            "last_category": last_category,
+        }
+
+    try:
+        # تهيئة عميل جوجل بالطريقة الرسمية الصحيحة
+        client = genai.Client(api_key=api_key.strip())
+        
+        system_text = (
+            "أنت مساعد مبيعات ذكي ودود لمتجر ملابس واكسسوارات مصري اسمه Falcon Store. "
+            "أجب بالعربية المصرية وبأسلوب شيك ومختصر. "
+            "استخدم بيانات المتجر التالية كمرجع:\n"
+            + json.dumps(bot_instance.catalog, ensure_ascii=False)
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash", # أو gemini-1.5-flash لو ظهرت مشكلة
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=system_text,
+                temperature=0.4,
+                max_output_tokens=400,
+            )
+        )
+
+        reply_text = response.text.strip()
+        if not reply_text:
+            raise ValueError("Gemini returned an empty response")
+
+        return {
+            "reply": reply_text,
+            "choices": choices,
+            "last_category": last_category,
+        }
+
+    except Exception as e:
+        print("❌ Gemini SDK Error:", e)
+        return {
+            "reply": "حصلت مشكلة أثناء الاتصال بالخدمة. تقدر تختار من الأقسام التالية للمساعدة:",
+            "choices": ["رجالي", "حريمي", "كوتشات", "العروض"],
+            "last_category": last_category,
+        }
 
 @app.route("/api/chat", methods=["POST"])
-@app.route("/bot", methods=["POST"])
-def api_chat():
-    """نقطة الاتصال الرئيسية التي يستدعيها الموقع (React / Node.js / HTML)"""
-    data = request.get_json(silent=True) or {}
-    user_message = str(data.get("message", "")).strip()
-    session_id = str(data.get("session_id", "default_user"))[:120]
-
-    if not user_message:
-        return jsonify({
-            "reply": "اكتب سؤالك الأول، وأنا هساعدك في منتجات وعروض Falcon Shop.",
-            "choices": ["رجالي", "حريمي", "كوتشات", "إكسسوارات"]
-        }), 400
-
-    result = bot.get_response(user_message[:1000], session_id=session_id)
+def chat_api():
+    data = request.get_json() or {}
+    message = data.get("message", "")
+    session_id = data.get("session_id", str(uuid.uuid4()))
+    
+    result = bot.get_response(message, session_id)
     return jsonify(result)
 
 
 @app.route("/widget.js", methods=["GET"])
-def serve_widget_js():
-    """
-    Serves the Falcon Shop chat widget.
-    The backend and chatbot logic are Python; this JavaScript only renders
-    the browser UI and sends messages to the Python API.
-    """
-    api_url = request.host_url.rstrip("/") + "/api/chat"
-
-    js_code = r"""
-(function () {
-  if (document.getElementById("falcon-chat-root")) return;
-
-  const API_URL = "__API_URL__";
-  const SESSION_KEY = "falcon_shop_chat_session";
-
-  function createSessionId() {
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return window.crypto.randomUUID();
-      }
-    } catch (_) {}
-    return "falcon_" + Date.now() + "_" + Math.random().toString(36).slice(2);
-  }
-
-  let sessionId = "";
-  try {
-    sessionId = localStorage.getItem(SESSION_KEY) || createSessionId();
-    localStorage.setItem(SESSION_KEY, sessionId);
-  } catch (_) {
-    sessionId = createSessionId();
-  }
+def widget_js():
+    api_url = "https://karimelmasrey.pythonanywhere.com/api/chat"
+    
+    js_code = f"""
+(function() {{
+  const API_URL = "{api_url}";
+  const sessionId = "sess_" + Math.random().toString(36).substring(2, 9);
 
   const root = document.createElement("div");
   root.id = "falcon-chat-root";
   root.innerHTML = `
     <style>
-      #falcon-chat-root {
+      #falcon-chat-root {{
         --falcon-bg: #050816;
         --falcon-panel: #0b1224;
         --falcon-panel-2: #101a30;
@@ -701,22 +697,22 @@ def serve_widget_js():
         bottom: 24px;
         z-index: 99999;
         direction: ltr;
-      }
-      #falcon-chat-root * { box-sizing: border-box; }
+      }}
+      #falcon-chat-root * {{ box-sizing: border-box; }}
       #falcon-chat-root button,
-      #falcon-chat-root input { font: inherit; }
-      #falcon-chat-root .falcon-launcher {
+      #falcon-chat-root input {{ font: inherit; }}
+      #falcon-chat-root .falcon-launcher {{
         width: 64px; height: 64px; border: 0; border-radius: 22px;
         color: white; cursor: pointer; font-size: 25px;
         background: linear-gradient(120deg, var(--falcon-cyan), #6577dc 52%, var(--falcon-pink));
         box-shadow: 0 10px 34px rgba(6, 201, 232, .22), 0 8px 30px rgba(236, 72, 153, .18);
         transition: transform .2s ease, box-shadow .2s ease;
-      }
-      #falcon-chat-root .falcon-launcher:hover {
+      }}
+      #falcon-chat-root .falcon-launcher:hover {{
         transform: translateY(-3px) scale(1.03);
         box-shadow: 0 14px 38px rgba(6, 201, 232, .3), 0 10px 34px rgba(236, 72, 153, .25);
-      }
-      #falcon-chat-root .falcon-window {
+      }}
+      #falcon-chat-root .falcon-window {{
         display: none; flex-direction: column;
         width: min(380px, calc(100vw - 28px));
         height: min(570px, calc(100vh - 112px));
@@ -725,93 +721,93 @@ def serve_widget_js():
         border-radius: 22px;
         background: var(--falcon-bg);
         box-shadow: 0 22px 70px rgba(0, 0, 0, .48), 0 0 32px rgba(6, 201, 232, .08);
-      }
-      #falcon-chat-root .falcon-window.is-open { display: flex; animation: falcon-pop .2s ease-out; }
-      @keyframes falcon-pop {
-        from { opacity: 0; transform: translateY(10px) scale(.98); }
-        to { opacity: 1; transform: translateY(0) scale(1); }
-      }
-      #falcon-chat-root .falcon-header {
+      }}
+      #falcon-chat-root .falcon-window.is-open {{ display: flex; animation: falcon-pop .2s ease-out; }}
+      @keyframes falcon-pop {{
+        from {{ opacity: 0; transform: translateY(10px) scale(.98); }}
+        to {{ opacity: 1; transform: translateY(0) scale(1); }}
+      }}
+      #falcon-chat-root .falcon-header {{
         display: flex; align-items: center; justify-content: space-between;
         padding: 16px; background: linear-gradient(110deg, #071526, #151027);
         border-bottom: 1px solid var(--falcon-border);
-      }
-      #falcon-chat-root .falcon-brand { display: flex; align-items: center; gap: 11px; }
-      #falcon-chat-root .falcon-logo {
+      }}
+      #falcon-chat-root .falcon-brand {{ display: flex; align-items: center; gap: 11px; }}
+      #falcon-chat-root .falcon-logo {{
         width: 40px; height: 40px; display: grid; place-items: center;
         border-radius: 13px; font-size: 19px;
         background: linear-gradient(135deg, var(--falcon-cyan), #6875d9 55%, var(--falcon-pink));
-      }
-      #falcon-chat-root .falcon-title {
+      }}
+      #falcon-chat-root .falcon-title {{
         margin: 0; font-size: 15px; font-weight: 800; letter-spacing: .2px;
-      }
-      #falcon-chat-root .falcon-subtitle {
+      }}
+      #falcon-chat-root .falcon-subtitle {{
         margin-top: 4px; color: var(--falcon-muted); font-size: 11px;
-      }
-      #falcon-chat-root .falcon-online {
+      }}
+      #falcon-chat-root .falcon-online {{
         display: inline-block; width: 7px; height: 7px; border-radius: 50%;
         margin-right: 5px; background: #22c55e; box-shadow: 0 0 9px #22c55e;
-      }
-      #falcon-chat-root .falcon-close {
+      }}
+      #falcon-chat-root .falcon-close {{
         border: 0; background: transparent; color: #cbd5e1;
         font-size: 22px; cursor: pointer; padding: 4px 7px;
-      }
-      #falcon-chat-root .falcon-messages {
+      }}
+      #falcon-chat-root .falcon-messages {{
         flex: 1; overflow-y: auto; padding: 16px 13px;
         background:
           radial-gradient(ellipse at top right, rgba(6, 201, 232, .055), transparent 48%),
           radial-gradient(ellipse at bottom left, rgba(236, 72, 153, .05), transparent 45%),
           var(--falcon-bg);
-      }
-      #falcon-chat-root .falcon-message-row { display: flex; margin: 0 0 12px; }
-      #falcon-chat-root .falcon-message-row.user { justify-content: flex-end; }
-      #falcon-chat-root .falcon-bubble {
+      }}
+      #falcon-chat-root .falcon-message-row {{ display: flex; margin: 0 0 12px; }}
+      #falcon-chat-root .falcon-message-row.user {{ justify-content: flex-end; }}
+      #falcon-chat-root .falcon-bubble {{
         max-width: 86%; padding: 11px 13px; border-radius: 15px;
         font-size: 13px; line-height: 1.75; white-space: pre-wrap;
         overflow-wrap: anywhere;
-      }
-      #falcon-chat-root .falcon-message-row.bot .falcon-bubble {
+      }}
+      #falcon-chat-root .falcon-message-row.bot .falcon-bubble {{
         color: #e2e8f0; background: var(--falcon-panel-2);
         border: 1px solid var(--falcon-border); border-top-left-radius: 5px;
-      }
-      #falcon-chat-root .falcon-message-row.user .falcon-bubble {
+      }}
+      #falcon-chat-root .falcon-message-row.user .falcon-bubble {{
         color: #fff; background: linear-gradient(115deg, #087f9b, #5966c8 58%, #b83d87);
         border-top-right-radius: 5px;
-      }
-      #falcon-chat-root .falcon-typing { color: var(--falcon-muted); font-size: 12px; padding: 2px 5px 10px; }
-      #falcon-chat-root .falcon-chips {
+      }}
+      #falcon-chat-root .falcon-typing {{ color: var(--falcon-muted); font-size: 12px; padding: 2px 5px 10px; }}
+      #falcon-chat-root .falcon-chips {{
         display: flex; gap: 7px; overflow-x: auto; padding: 10px 12px;
         border-top: 1px solid var(--falcon-border); background: #080e1e;
-      }
-      #falcon-chat-root .falcon-chip {
+      }}
+      #falcon-chat-root .falcon-chip {{
         flex: 0 0 auto; border: 1px solid rgba(6, 201, 232, .3);
         color: #bceefa; background: rgba(6, 201, 232, .08);
         border-radius: 999px; padding: 7px 11px; font-size: 11px; cursor: pointer;
-      }
-      #falcon-chat-root .falcon-chip:hover { background: rgba(236, 72, 153, .13); border-color: rgba(236, 72, 153, .5); }
-      #falcon-chat-root .falcon-form {
+      }}
+      #falcon-chat-root .falcon-chip:hover {{ background: rgba(236, 72, 153, .13); border-color: rgba(236, 72, 153, .5); }}
+      #falcon-chat-root .falcon-form {{
         display: flex; gap: 8px; padding: 12px;
         background: #080e1e; border-top: 1px solid var(--falcon-border);
-      }
-      #falcon-chat-root .falcon-input {
+      }}
+      #falcon-chat-root .falcon-input {{
         min-width: 0; flex: 1; color: white; outline: none;
         border: 1px solid #26344d; border-radius: 12px;
         background: #0d172a; padding: 11px 12px; font-size: 12px;
-      }
-      #falcon-chat-root .falcon-input:focus { border-color: var(--falcon-cyan); box-shadow: 0 0 0 3px rgba(6, 201, 232, .1); }
-      #falcon-chat-root .falcon-send {
+      }}
+      #falcon-chat-root .falcon-input:focus {{ border-color: var(--falcon-cyan); box-shadow: 0 0 0 3px rgba(6, 201, 232, .1); }}
+      #falcon-chat-root .falcon-send {{
         border: 0; border-radius: 12px; padding: 0 15px;
         color: white; font-weight: 700; cursor: pointer;
         background: linear-gradient(115deg, var(--falcon-cyan), #6675d9 55%, var(--falcon-pink));
-      }
-      #falcon-chat-root .falcon-send:disabled { opacity: .55; cursor: wait; }
-      @media (max-width: 480px) {
-        #falcon-chat-root { right: 14px; bottom: 14px; }
-        #falcon-chat-root .falcon-window {
+      }}
+      #falcon-chat-root .falcon-send:disabled {{ opacity: .55; cursor: wait; }}
+      @media (max-width: 480px) {{
+        #falcon-chat-root {{ right: 14px; bottom: 14px; }}
+        #falcon-chat-root .falcon-window {{
           width: calc(100vw - 28px); height: min(68vh, 560px);
-        }
-        #falcon-chat-root .falcon-launcher { width: 58px; height: 58px; border-radius: 19px; }
-      }
+        }}
+        #falcon-chat-root .falcon-launcher {{ width: 58px; height: 58px; border-radius: 19px; }}
+      }}
     </style>
 
     <section class="falcon-window" id="falcon-window" aria-label="Falcon Shop chat">
@@ -848,33 +844,32 @@ def serve_widget_js():
   const input = root.querySelector("#falcon-input");
   const sendButton = root.querySelector("#falcon-send");
 
-  function addMessage(text, sender) {
+  function addMessage(text, sender) {{
     const row = document.createElement("div");
     row.className = "falcon-message-row " + sender;
     const bubble = document.createElement("div");
     bubble.className = "falcon-bubble";
-    // textContent prevents a message from being interpreted as HTML.
     bubble.textContent = String(text ?? "");
     row.appendChild(bubble);
     messages.appendChild(row);
     messages.scrollTop = messages.scrollHeight;
     return row;
-  }
+  }}
 
-  function renderChips(list) {
+  function renderChips(list) {{
     chips.replaceChildren();
     (Array.isArray(list) && list.length ? list : ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"])
-      .forEach((label) => {
+      .forEach((label) => {{
         const chip = document.createElement("button");
         chip.type = "button";
         chip.className = "falcon-chip";
         chip.textContent = String(label);
         chip.addEventListener("click", () => sendMessage(String(label)));
         chips.appendChild(chip);
-      });
-  }
+      }});
+  }}
 
-  async function sendMessage(rawText) {
+  async function sendMessage(rawText) {{
     const text = String(rawText || "").trim();
     if (!text || sendButton.disabled) return;
 
@@ -884,66 +879,55 @@ def serve_widget_js():
 
     const typing = addMessage("Falcon is typing...", "bot");
 
-    try {
-      const response = await fetch(API_URL, {
+    try {{
+      const response = await fetch(API_URL, {{
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, session_id: sessionId })
-      });
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ message: text, session_id: sessionId }})
+      }});
 
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
       typing.remove();
       addMessage(data.reply || "Sorry, I couldn't prepare a reply.", "bot");
       renderChips(data.choices);
-    } catch (error) {
+    }} catch (error) {{
       typing.remove();
       addMessage("Couldn't connect to Falcon Shop right now. Please make sure the Python server is running.", "bot");
-    } finally {
+    }} finally {{
       sendButton.disabled = false;
       input.focus();
-    }
-  }
+    }}
+  }}
 
-  launcher.addEventListener("click", () => {
+  launcher.addEventListener("click", () => {{
     const open = !win.classList.contains("is-open");
     win.classList.toggle("is-open", open);
     launcher.setAttribute("aria-expanded", String(open));
     if (open) input.focus();
-  });
+  }});
 
-  close.addEventListener("click", () => {
+  close.addEventListener("click", () => {{
     win.classList.remove("is-open");
     launcher.setAttribute("aria-expanded", "false");
-  });
+  }});
 
-  form.addEventListener("submit", (event) => {
+  form.addEventListener("submit", (event) => {{
     event.preventDefault();
     sendMessage(input.value);
-  });
+  }});
 
   addMessage("Welcome to Falcon Shop! 👋 Ask me about our collections, prices, sizes or offers.", "bot");
   renderChips(["Shop men", "Shop women", "Sneakers", "Accessories", "Offers"]);
-})();
+}})();
 """
-    js_code = js_code.replace("__API_URL__", api_url)
     return Response(js_code, mimetype="application/javascript")
 
 
 if __name__ == "__main__":
-    # إذا تم تشغيله في التيرمينال بوضع المحادثة النصية: python falcon_chatbot.py --cli
-    if "--cli" in sys.argv:
-        print("=== بوت Falcon Store بالبايثون (اكتب 'خروج' للإغلاق) ===")
-        while True:
-            user_in = input("أنت: ").strip()
-            if user_in in ("خروج", "exit", "quit"):
-                break
-            out = bot.get_response(user_in)
-            print(f"البوت:\n{out['reply']}\n")
-    else:
-        print("====================================================")
-        print("Falcon Store Python Chatbot Server is running!")
-        print("API Endpoint : http://127.0.0.1:5001/api/chat")
-        print("Widget Script: http://127.0.0.1:5001/widget.js")
-        print("====================================================")
-        app.run(host="127.0.0.1", port=5001, debug=False)
+    print("====================================================")
+    print("Falcon Store Python Chatbot Server is running!")
+    print("API Endpoint : http://127.0.0.1:5001/api/chat")
+    print("Widget Script: http://127.0.0.1:5001/widget.js")
+    print("====================================================")
+    app.run(host="127.0.0.1", port=5001, debug=False)
