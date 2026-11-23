@@ -9,19 +9,18 @@ import os
 import re
 import json
 import uuid
+import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from google import genai
-from google.genai import types
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 app = Flask(__name__)
 CORS(app)
 
-BACKEND_BASE_URL = "https://karimelmasrey.pythonanywhere.com"
+BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL") or "https://karimelmasrey.pythonanywhere.com").rstrip("/")
 
 
 class FalconStoreBot:
@@ -346,9 +345,15 @@ class FalconStoreBot:
     def get_response(self, message: str, session_id: str = "default") -> dict:
         session = self.get_session(session_id)
         clean_input = str(message).strip()
+        if not clean_input:
+            return {
+                "reply": "اكتب سؤالك أو اختر قسماً من بالأسفل وسأساعدك فوراً.",
+                "choices": ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"],
+                "last_category": session["last_category"],
+            }
+
         n = self.normalize_arabic(clean_input)
         words = set(re.findall(r"\w+", n))
-
         mentioned_cat = self.detect_category(n)
 
         is_asking_offers = (
@@ -508,7 +513,7 @@ class FalconStoreBot:
                 "reply": (
                     "📋 ملخص أسعار Falcon Store:\n"
                     "• الرجالي: تيشيرتات (450 ج)، قمصان (580 ج)، بناطيل كارجو (650 ج)، هوديز (750 ج).\n"
-                    "• الحريمي: شميزات كتان (520 ج), جينز وايد ليج (680 ج)، دريسات (720 ج)، أطقم كارديجان (850 ج).\n"
+                    "• الحريمي: شميزات كتان (520 ج)، جينز وايد ليج (680 ج)، دريسات (720 ج)، أطقم كارديجان (850 ج).\n"
                     "• الكوتشات: تبدأ من 790 ج حتى 920 ج (مقاسات 37 لـ 45).\n"
                     "• الإكسسوارات: نظارات (380 ج)، طقم محفظة وحزام جلد (520 ج)، شنط (590 ج)، ساعات (620 ج)."
                 ),
@@ -573,41 +578,52 @@ bot = FalconStoreBot()
 
 
 def ask_gemini_fallback(user_message: str, session_id: str, bot_instance: FalconStoreBot) -> dict:
-    """دالة الاتصال بـ Gemini باستخدام مكتبة google-genai الرسمية"""
-    load_dotenv(os.path.join(BASE_DIR, ".env"))
-    api_key = os.getenv("GEMINI_API_KEY")
+    """دالة الرد الذكي للأسئلة الحرة باستخدام Groq API مع الالتزام بكتالوج المتجر"""
     choices = ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"]
     last_category = bot_instance.get_session(session_id).get("last_category")
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
 
-    if not api_key:
+    if not groq_key:
         return {
             "reply": "أهلاً بك في Falcon Store! أقدر أساعدك في معرفة تفاصيل المنتجات، الأسعار، العروض، والشحن.",
             "choices": choices,
             "last_category": last_category,
         }
 
+    system_text = (
+        "أنت مساعد مبيعات ذكي ودود لمتجر ملابس وكوتشات وإكسسوارات مصري اسمه Falcon Store. "
+        "أجب بالعربية المصرية وبأسلوب شيك، واضح، ومختصر يناسب نافذة الدردشة. "
+        "اعتمد فقط على بيانات المتجر المرفقة ولا تخترع منتجات أو أسعار أو عروض غير موجودة فيها:\n"
+        + json.dumps(bot_instance.catalog, ensure_ascii=False)
+    )
+
     try:
-        client = genai.Client(api_key=api_key.strip())
-        system_text = (
-            "أنت مساعد مبيعات ذكي ودود لمتجر ملابس واكسسوارات مصري اسمه Falcon Store. "
-            "أجب بالعربية المصرية وبأسلوب شيك ومختصر. "
-            "استخدم بيانات المتجر التالية كمرجع:\n"
-            + json.dumps(bot_instance.catalog, ensure_ascii=False)
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_message},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 450,
+            },
+            timeout=20,
         )
+        data = res.json()
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_message,
-            config=types.GenerateContentConfig(
-                system_instruction=system_text,
-                temperature=0.4,
-                max_output_tokens=400,
-            ),
-        )
+        if not res.ok:
+            print("Groq API Error:", res.status_code, data)
+            raise ValueError(data.get("error", {}).get("message", "Groq request failed"))
 
-        reply_text = (response.text or "").strip()
+        reply_text = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
         if not reply_text:
-            raise ValueError("Gemini returned an empty response")
+            raise ValueError("Empty response from Groq")
 
         return {
             "reply": reply_text,
@@ -616,9 +632,9 @@ def ask_gemini_fallback(user_message: str, session_id: str, bot_instance: Falcon
         }
 
     except Exception as e:
-        print("Gemini SDK Error:", e)
+        print("AI Fallback Error:", e)
         return {
-            "reply": "حصلت مشكلة أثناء الاتصال بالخدمة حالياً. تقدر تختار من الأقسام التالية للمساعدة:",
+            "reply": "حصلت مشكلة أثناء الاتصال بالمساعد الذكي حالياً. تقدر تختار من الأقسام التالية:",
             "choices": ["رجالي", "حريمي", "كوتشات", "العروض"],
             "last_category": last_category,
         }
@@ -645,7 +661,18 @@ def widget_js():
     js_code = f"""
 (function() {{
   const API_URL = "{api_url}";
-  const sessionId = "sess_" + Math.random().toString(36).substring(2, 10);
+  const STORAGE_KEY = "falcon_store_session_id";
+  let sessionId = null;
+
+  try {{
+    sessionId = localStorage.getItem(STORAGE_KEY);
+    if (!sessionId) {{
+      sessionId = "sess_" + Math.random().toString(36).substring(2, 12);
+      localStorage.setItem(STORAGE_KEY, sessionId);
+    }}
+  }} catch (e) {{
+    sessionId = "sess_" + Math.random().toString(36).substring(2, 12);
+  }}
 
   if (document.getElementById("falcon-chat-root")) return;
 
@@ -732,33 +759,48 @@ def widget_js():
       }}
       #falcon-chat-root .falcon-msg.user {{
         align-self: flex-end;
-        background: linear-gradient(120deg, #0891b2, #6366f1);
         color: #fff;
+        background: linear-gradient(120deg, var(--falcon-cyan), var(--falcon-pink));
       }}
       #falcon-chat-root .falcon-choices {{
-        display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px;
+        display: flex; flex-wrap: wrap; gap: 6px;
+        padding: 0 14px 10px;
       }}
       #falcon-chat-root .falcon-choice-btn {{
-        background: var(--falcon-panel-2); color: var(--falcon-cyan);
-        border: 1px solid rgba(6, 201, 232, .35); border-radius: 999px;
-        padding: 5px 11px; font-size: 12px; cursor: pointer;
+        background: var(--falcon-panel-2);
+        color: var(--falcon-text);
+        border: 1px solid rgba(6, 201, 232, .32);
+        border-radius: 999px;
+        padding: 5px 11px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: background .15s ease, transform .15s ease;
       }}
       #falcon-chat-root .falcon-choice-btn:hover {{
-        background: rgba(6, 201, 232, .14);
+        background: rgba(6, 201, 232, .16);
+        transform: translateY(-1px);
       }}
-      #falcon-chat-root .falcon-input-row {{
-        display: flex; gap: 8px; padding: 12px;
+      #falcon-chat-root .falcon-input-area {{
+        display: flex; gap: 8px; padding: 10px 12px;
         background: var(--falcon-panel);
         border-top: 1px solid rgba(148, 163, 184, .16);
       }}
       #falcon-chat-root .falcon-input {{
-        flex: 1; background: var(--falcon-bg); color: var(--falcon-text);
-        border: 1px solid rgba(148, 163, 184, .25);
-        border-radius: 12px; padding: 9px 12px; font-size: 13.5px; outline: none;
+        flex: 1; border: 1px solid rgba(148, 163, 184, .22);
+        border-radius: 12px; padding: 9px 12px;
+        background: var(--falcon-bg); color: var(--falcon-text);
+        font-size: 13.5px; outline: none;
+      }}
+      #falcon-chat-root .falcon-input:focus {{
+        border-color: var(--falcon-cyan);
       }}
       #falcon-chat-root .falcon-send {{
-        background: var(--falcon-cyan); color: #050816; font-weight: 700;
-        border: 0; border-radius: 12px; padding: 0 14px; cursor: pointer;
+        border: 0; border-radius: 12px; padding: 0 14px;
+        color: #fff; font-weight: 600; cursor: pointer;
+        background: linear-gradient(120deg, var(--falcon-cyan), var(--falcon-pink));
+      }}
+      #falcon-chat-root .falcon-send:disabled {{
+        opacity: .55; cursor: not-allowed;
       }}
     </style>
 
@@ -766,19 +808,19 @@ def widget_js():
       <div class="falcon-header">
         <div>
           <div class="falcon-title">مساعد Falcon Store</div>
-          <div class="falcon-sub">متاح للمساعدة • رجالي، حريمي، كوتشات، إكسسوارات</div>
+          <div class="falcon-sub">ملابس • كوتشات • إكسسوارات • عروض</div>
         </div>
-        <button type="button" class="falcon-close" id="falcon-close" aria-label="إغلاق">✕</button>
+        <button class="falcon-close" id="falcon-close" aria-label="إغلاق">✕</button>
       </div>
       <div class="falcon-messages" id="falcon-messages"></div>
       <div class="falcon-choices" id="falcon-choices"></div>
-      <form class="falcon-input-row" id="falcon-form">
-        <input type="text" class="falcon-input" id="falcon-input" placeholder="اكتب سؤالك هنا..." autocomplete="off" />
-        <button type="submit" class="falcon-send">إرسال</button>
+      <form class="falcon-input-area" id="falcon-form">
+        <input class="falcon-input" id="falcon-input" type="text" placeholder="اكتب سؤالك هنا..." autocomplete="off" />
+        <button class="falcon-send" id="falcon-send" type="submit">إرسال</button>
       </form>
     </div>
 
-    <button type="button" class="falcon-launcher" id="falcon-launcher" aria-label="فتح المحادثة">💬</button>
+    <button class="falcon-launcher" id="falcon-launcher" aria-label="فتح المساعد">💬</button>
   `;
 
   document.body.appendChild(root);
@@ -790,24 +832,26 @@ def widget_js():
   const choicesEl = document.getElementById("falcon-choices");
   const formEl = document.getElementById("falcon-form");
   const inputEl = document.getElementById("falcon-input");
+  const sendEl = document.getElementById("falcon-send");
 
-  function addMsg(text, sender) {{
+  function appendMessage(text, sender) {{
     const div = document.createElement("div");
     div.className = "falcon-msg " + sender;
     div.textContent = text;
     msgsEl.appendChild(div);
     msgsEl.scrollTop = msgsEl.scrollHeight;
+    return div;
   }}
 
-  function renderChoices(list) {{
+  function renderChoices(choices) {{
     choicesEl.innerHTML = "";
-    if (!Array.isArray(list)) return;
-    list.forEach((label) => {{
+    if (!Array.isArray(choices) || !choices.length) return;
+    choices.forEach((choiceText) => {{
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "falcon-choice-btn";
-      btn.textContent = label;
-      btn.addEventListener("click", () => sendMessage(label));
+      btn.textContent = choiceText;
+      btn.addEventListener("click", () => sendMessage(choiceText));
       choicesEl.appendChild(btn);
     }});
   }}
@@ -815,37 +859,52 @@ def widget_js():
   async function sendMessage(text) {{
     const clean = (text || "").trim();
     if (!clean) return;
-    addMsg(clean, "user");
+
+    appendMessage(clean, "user");
     inputEl.value = "";
+    sendEl.disabled = true;
     renderChoices([]);
 
-    const typingDiv = document.createElement("div");
-    typingDiv.className = "falcon-msg bot";
-    typingDiv.textContent = "جاري الكتابة...";
-    msgsEl.appendChild(typingDiv);
-    msgsEl.scrollTop = msgsEl.scrollHeight;
+    const typingEl = appendMessage("جاري الكتابة...", "bot");
 
     try {{
       const res = await fetch(API_URL, {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ message: clean, session_id: sessionId }})
+        body: JSON.stringify({{ message: clean, session_id: sessionId }}),
       }});
       const data = await res.json();
-      typingDiv.remove();
-      addMsg(data.reply || "تم استلام رسالتك.", "bot");
-      renderChoices(data.choices);
+      typingEl.remove();
+
+      if (!res.ok) {{
+        appendMessage(data.error || "حدث خطأ أثناء الاتصال بالمساعد.", "bot");
+        renderChoices(["العروض", "رجالي", "حريمي", "كوتشات"]);
+        return;
+      }}
+
+      appendMessage(data.reply || "أهلاً بك في Falcon Store!", "bot");
+      renderChoices(data.choices || ["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"]);
     }} catch (err) {{
-      typingDiv.remove();
-      addMsg("تعذر الاتصال بالسيرفر الآن، حاول مرة أخرى.", "bot");
+      typingEl.remove();
+      appendMessage("تعذر الاتصال بالسيرفر حالياً، حاول مرة أخرى.", "bot");
+      renderChoices(["العروض", "رجالي", "حريمي", "كوتشات"]);
+    }} finally {{
+      sendEl.disabled = false;
+      inputEl.focus();
     }}
   }}
 
   launcherEl.addEventListener("click", () => {{
     winEl.classList.toggle("is-open");
-    if (winEl.classList.contains("is-open") && msgsEl.children.length === 0) {{
-      addMsg("أهلاً بك في Falcon Store! كيف أقدر أساعدك اليوم؟", "bot");
-      renderChoices(["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"]);
+    if (winEl.classList.contains("is-open")) {{
+      if (!msgsEl.children.length) {{
+        appendMessage(
+          "أهلاً وسهلاً بيك في Falcon Store 👋 إزاي أقدر أساعدك النهاردة؟",
+          "bot"
+        );
+        renderChoices(["العروض", "رجالي", "حريمي", "كوتشات", "إكسسوارات"]);
+      }}
+      inputEl.focus();
     }}
   }});
 
@@ -858,9 +917,10 @@ def widget_js():
     sendMessage(inputEl.value);
   }});
 }})();
-"""
+""";
+
     return Response(js_code, mimetype="application/javascript")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
